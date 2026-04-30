@@ -1,0 +1,20 @@
+﻿# ===========================================================
+# fb-position-management — Deploy (chama pipeline compartilhado da org)
+# ===========================================================
+# Trigger: push na branch main
+# Pipeline: FinBot-Crypto/.github/.github/workflows/deploy-service.yml
+# ===========================================================
+
+name: Deploy
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  deploy:
+    uses: FinBot-Crypto/.github/.github/workflows/deploy-service.yml@main
+    with:
+      service_name: fb-position-management
+      compose_service: position-management
+    secrets: inherit
