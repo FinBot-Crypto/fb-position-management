@@ -2,15 +2,15 @@
 fb-position-monitor: Monitora posições abertas e decide quando fechar.
 
 Fluxo:
-  trade.executed → registra posição
+  trade.executed → registra posição + INSERT no banco
   Loop a cada 10s:
     → verifica TP/SL atingido (preço)
     → verifica RSI reversal (RSI > RSI_EXIT)
     → verifica time exit (hold > MAX_HOLD_HOURS)
     → trailing stop (move SL conforme lucro)
-    → se fechar: publica trade.closed, cancela ordens restantes
+    → se fechar: publica trade.closed, cancela ordens, UPDATE no banco
 """
-import asyncio, logging, os, json, time, numpy as np, ccxt, nats
+import asyncio, logging, os, json, time, numpy as np, ccxt, nats, psycopg2
 from nats.js.api import ConsumerConfig
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -28,6 +28,7 @@ TRAILING_ACTIVATION = float(os.getenv("TRAILING_ACTIVATION", "1.0"))  # ativa ap
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "")
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://crypto_admin:ZNG5z43LaSrk7FEmwu6CPtRUB2IVKdvY@crypto-postgres:5432/crypto_bot")
 
 
 class PositionMonitor:
@@ -47,6 +48,101 @@ class PositionMonitor:
         self.js = self.nc.jetstream()
         self.kv = await self.js.key_value("active_positions")
         logger.info(f"NATS conectado: {NATS_URL}")
+
+    async def init_db(self):
+        """Cria tabela trade_log se não existir."""
+        try:
+            conn = psycopg2.connect(DATABASE_URL)
+            cur = conn.cursor()
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS trade_log (
+                    id SERIAL PRIMARY KEY,
+                    symbol VARCHAR(20) NOT NULL,
+                    tier VARCHAR(30),
+                    strategy VARCHAR(50),
+                    direction VARCHAR(10) DEFAULT 'LONG',
+                    dry_run BOOLEAN DEFAULT TRUE,
+                    score FLOAT,
+                    rsi FLOAT,
+                    entry_price FLOAT NOT NULL,
+                    quantity FLOAT NOT NULL,
+                    sl_price FLOAT,
+                    tp_price FLOAT,
+                    exit_price FLOAT,
+                    exit_reason VARCHAR(30),
+                    pnl_pct FLOAT,
+                    hold_hours FLOAT,
+                    status VARCHAR(10) DEFAULT 'OPEN',
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW()
+                );
+            """)
+            conn.commit()
+            cur.close()
+            conn.close()
+            logger.info("Banco de dados conectado, tabela trade_log pronta")
+        except Exception as e:
+            logger.error(f"Erro ao inicializar banco: {e}")
+
+    async def log_trade_open(self, execution):
+        """Insere trade no banco como OPEN."""
+        try:
+            conn = psycopg2.connect(DATABASE_URL)
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO trade_log (symbol, tier, strategy, direction, dry_run,
+                    score, rsi, entry_price, quantity, sl_price, tp_price, status)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'OPEN')
+                RETURNING id;
+            """, (
+                execution.get("symbol"),
+                execution.get("tier"),
+                execution.get("strategy"),
+                execution.get("direction", "LONG"),
+                DRY_RUN,
+                execution.get("score"),
+                execution.get("rsi"),
+                execution.get("entry_price"),
+                execution.get("quantity"),
+                execution.get("sl_price"),
+                execution.get("tp_price"),
+            ))
+            trade_id = cur.fetchone()[0]
+            conn.commit()
+            cur.close()
+            conn.close()
+            logger.info(f"  DB: trade #{trade_id} OPEN — {execution['symbol']}")
+            return trade_id
+        except Exception as e:
+            logger.error(f"Erro ao logar abertura no banco: {e}")
+            return None
+
+    async def log_trade_close(self, symbol, reason_data, pos):
+        """Atualiza trade no banco como CLOSED."""
+        try:
+            conn = psycopg2.connect(DATABASE_URL)
+            cur = conn.cursor()
+            cur.execute("""
+                UPDATE trade_log
+                SET exit_price = %s, exit_reason = %s, pnl_pct = %s,
+                    hold_hours = %s, status = 'CLOSED', updated_at = NOW()
+                WHERE symbol = %s AND status = 'OPEN'
+                ORDER BY created_at DESC LIMIT 1;
+            """, (
+                reason_data["price"],
+                reason_data["reason"],
+                reason_data["pnl_pct"],
+                (time.time() - pos.get("entry_time", time.time())) / 3600,
+                symbol,
+            ))
+            updated = cur.rowcount
+            conn.commit()
+            cur.close()
+            conn.close()
+            if updated:
+                logger.info(f"  DB: trade CLOSED — {symbol} ({reason_data['reason']})")
+        except Exception as e:
+            logger.error(f"Erro ao logar fechamento no banco: {e}")
 
     async def load_positions_from_kv(self):
         """Carrega posições salvas no KV store ao iniciar."""
@@ -175,6 +271,9 @@ class PositionMonitor:
         if symbol in self.positions:
             del self.positions[symbol]
 
+        # Log no banco
+        await self.log_trade_close(symbol, reason_data, pos)
+
         # Publica trade.closed
         close_event = {
             "symbol": symbol,
@@ -214,6 +313,7 @@ class PositionMonitor:
 
                 self.positions[key] = pos
                 await self.kv.put(key, json.dumps(pos).encode())
+                await self.log_trade_open(ex)
                 logger.info(f"POSIÇÃO ABERTA: {symbol} qty={ex['quantity']} entry={ex['entry_price']}")
 
             await msg.ack()
@@ -239,6 +339,7 @@ class PositionMonitor:
 
     async def run(self):
         await self.connect_nats()
+        await self.init_db()
         await self.load_positions_from_kv()
 
         # Subscreve a trade.executed para registrar novas posições
