@@ -169,6 +169,27 @@ class PositionMonitor:
         rsi = 100 - 100 / (1 + avg_gain / (avg_loss + 1e-10))
         return float(rsi[-1])
 
+    async def sync_position_with_exchange(self, symbol, pos):
+        """Verifica se a posição ainda existe na Binance. Se não, foi fechada externamente."""
+        if DRY_RUN:
+            return None  # sem sincronia em dry run
+        try:
+            base = symbol.split("/")[0]
+            balance = self.exchange.fetch_balance()
+            total_amount = balance["total"].get(base, 0)
+            if total_amount <= 0:
+                # Posição foi fechada externamente (OC/SL/TP executou na Binance)
+                try:
+                    ticker = self.exchange.fetch_ticker(symbol)
+                    exit_price = ticker["last"]
+                except Exception:
+                    exit_price = pos.get("entry_price", 0)
+                pnl_pct = (exit_price / pos["entry_price"] - 1) * 100 if pos.get("entry_price", 0) > 0 else 0
+                return {"reason": "EXCHANGE_CLOSED", "price": exit_price, "pnl_pct": pnl_pct}
+        except Exception as e:
+            logger.error(f"Erro sync {symbol}: {e}")
+        return None  # posição ainda existe
+
     async def check_position(self, symbol, pos):
         """Verifica se uma posição deve ser fechada."""
         try:
@@ -331,6 +352,12 @@ class PositionMonitor:
             positions_snapshot = list(self.positions.items())
             for key, pos in positions_snapshot:
                 symbol = pos["symbol"]
+                # 0. Sync: verifica se posição ainda existe na Binance (fechada por OCO?)
+                exchange_result = await self.sync_position_with_exchange(symbol, pos)
+                if exchange_result:
+                    await self.close_position(symbol, pos, exchange_result)
+                    continue
+                # 1-5. Checks normais (TP/SL/RSI/time/trailing)
                 result = await self.check_position(symbol, pos)
                 if result:
                     await self.close_position(symbol, pos, result)
