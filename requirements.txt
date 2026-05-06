@@ -1,4 +1,4 @@
-﻿pika
-redis
-requests
+﻿nats-py
+ccxt
+numpy
 pandas
