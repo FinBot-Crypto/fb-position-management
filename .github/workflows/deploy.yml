@@ -28,6 +28,7 @@ jobs:
         with:
           context: .
           push: true
+          platforms: linux/arm64
           tags: ghcr.io/finbot-crypto/fb-position-management:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
