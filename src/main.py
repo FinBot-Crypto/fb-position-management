@@ -117,10 +117,11 @@ class PositionMonitor:
                 ohlcv = self.exchange.fetch_ohlcv(symbol, "15m", limit=50)
                 highs = [c[2] for c in ohlcv]
                 lows = [c[3] for c in ohlcv]
+                tr_closes = [c[4] for c in ohlcv]
                 tr = np.maximum.reduce([
                     np.array(highs[1:]) - np.array(lows[1:]),
-                    np.abs(np.array(highs[1:]) - np.array(closes[:-1])),
-                    np.abs(np.array(lows[1:]) - np.array(closes[:-1])),
+                    np.abs(np.array(highs[1:]) - np.array(tr_closes[:-1])),
+                    np.abs(np.array(lows[1:]) - np.array(tr_closes[:-1])),
                 ])
                 atr = float(np.mean(tr[-14:])) if len(tr) >= 14 else 0.01
 
