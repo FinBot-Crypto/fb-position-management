@@ -126,8 +126,11 @@ class PositionMonitor:
                 UPDATE trade_log
                 SET exit_price = %s, exit_reason = %s, pnl_pct = %s,
                     hold_hours = %s, status = 'CLOSED', updated_at = NOW()
-                WHERE symbol = %s AND status = 'OPEN'
-                ORDER BY created_at DESC LIMIT 1;
+                WHERE id = (
+                    SELECT id FROM trade_log
+                    WHERE symbol = %s AND status = 'OPEN'
+                    ORDER BY created_at DESC LIMIT 1
+                );
             """, (
                 reason_data["price"],
                 reason_data["reason"],
