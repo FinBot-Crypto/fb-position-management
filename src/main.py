@@ -283,11 +283,30 @@ class PositionMonitor:
                 except Exception as e:
                     logger.error(f"  {symbol}: erro ao cancelar ordens: {e}")
 
-                # Market sell
+                # Market sell: usa saldo total se for a única posição da moeda
                 try:
-                    qty_str = self.exchange.amount_to_precision(symbol, quantity)
-                    sell_order = self.exchange.create_order(symbol, "market", "sell", qty_str)
-                    logger.info(f"  {symbol}: SELL executado {qty_str} @ ~{price}")
+                    # Verifica se há outro trade OPEN do mesmo símbolo
+                    conn = psycopg2.connect(DATABASE_URL)
+                    cur = conn.cursor()
+                    cur.execute("SELECT COUNT(*) FROM trade_log WHERE symbol = %s AND status = 'OPEN'", (symbol,))
+                    open_count = cur.fetchone()[0]
+                    cur.close()
+                    conn.close()
+
+                    if open_count <= 1:
+                        bal = self.exchange.fetch_balance()
+                        base = symbol.split("/")[0]
+                        sell_qty = bal["free"].get(base, quantity)
+                        logger.info(f"  {symbol}: única posição, vendendo saldo total: {sell_qty}")
+                    else:
+                        sell_qty = quantity
+
+                    qty_str = self.exchange.amount_to_precision(symbol, sell_qty)
+                    if float(qty_str) > 0:
+                        sell_order = self.exchange.create_order(symbol, "market", "sell", qty_str)
+                        logger.info(f"  {symbol}: SELL executado {qty_str} @ ~{price}")
+                    else:
+                        logger.info(f"  {symbol}: quantidade zero, pulando venda (já foi vendido)")
                     sold_ok = True
                 except Exception as e:
                     logger.error(f"  {symbol}: erro ao vender: {e} — posição NÃO fechada")
