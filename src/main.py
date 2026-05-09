@@ -261,7 +261,7 @@ class PositionMonitor:
         return None  # mantém posição
 
     async def close_position(self, symbol, pos, reason_data):
-        """Fecha posição: cancela ordens restantes e publica trade.closed."""
+        """Fecha posição: cancela ordens, vende, só marca CLOSED se sucesso."""
         reason = reason_data["reason"]
         price = reason_data["price"]
         pnl_pct = reason_data["pnl_pct"]
@@ -270,20 +270,30 @@ class PositionMonitor:
 
         logger.info(f"FECHANDO {symbol}: {reason} @ {price:.6f} | PnL: {pnl_pct:.2f}%")
 
-        # Cancela ordens abertas de SL/TP na Binance
-        if not DRY_RUN:
-            try:
-                self.exchange.cancel_all_orders(symbol)
-                logger.info(f"  {symbol}: ordens SL/TP canceladas")
-            except Exception as e:
-                logger.error(f"  {symbol}: erro ao cancelar ordens: {e}")
+        sold_ok = DRY_RUN  # dry run sempre ok
 
-            # Market sell para fechar posição
-            try:
-                sell_order = self.exchange.create_order(symbol, "market", "sell", quantity)
-                logger.info(f"  {symbol}: SELL executado {quantity} @ ~{price}")
-            except Exception as e:
-                logger.error(f"  {symbol}: erro ao vender: {e}")
+        if not DRY_RUN:
+            # Se foi fechado externamente (OCO), só confirma
+            if reason == "EXCHANGE_CLOSED":
+                sold_ok = True  # já foi fechado pela Binance
+            else:
+                # Cancela OCO
+                try:
+                    self.exchange.cancel_all_orders(symbol)
+                except Exception as e:
+                    logger.error(f"  {symbol}: erro ao cancelar ordens: {e}")
+
+                # Market sell
+                try:
+                    qty_str = self.exchange.amount_to_precision(symbol, quantity)
+                    sell_order = self.exchange.create_order(symbol, "market", "sell", qty_str)
+                    logger.info(f"  {symbol}: SELL executado {qty_str} @ ~{price}")
+                    sold_ok = True
+                except Exception as e:
+                    logger.error(f"  {symbol}: erro ao vender: {e} — posição NÃO fechada")
+
+        if not sold_ok:
+            return  # não fecha, tenta de novo no próximo ciclo
 
         # Remove do KV
         key = symbol.replace("/", "_")
