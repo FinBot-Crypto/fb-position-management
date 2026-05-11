@@ -381,7 +381,7 @@ class PositionMonitor:
             logger.error(f"Erro ao processar trade executado: {e}")
 
     async def convert_dust(self):
-        """Converte todos os saldos abaixo de $1 para BNB (grátis)."""
+        """Converte todos os saldos abaixo de $1 para BNB (grátis). Mantém colchão de BNB."""
         try:
             bal = self.exchange.fetch_balance()
             dust_list = []
@@ -394,23 +394,35 @@ class PositionMonitor:
                     val = 0
                 if val < 1:
                     dust_list.append(a)
-            if not dust_list:
-                return
 
             import re
-            while dust_list:
-                try:
-                    r = self.exchange.sapi_post_asset_dust({"asset": dust_list})
-                    converted = r.get("transferResult", [])
-                    if converted:
-                        logger.info(f"Dust: {len(converted)} ativos convertidos pra BNB")
-                    break
-                except Exception as e:
-                    bad = re.findall(r"[A-Z]{2,6}", str(e))
-                    bad = [b for b in bad if b in dust_list]
-                    if not bad:
+            if dust_list:
+                while dust_list:
+                    try:
+                        r = self.exchange.sapi_post_asset_dust({"asset": dust_list})
+                        converted = r.get("transferResult", [])
+                        if converted:
+                            logger.info(f"Dust: {len(converted)} ativos convertidos pra BNB")
                         break
-                    dust_list = [d for d in dust_list if d not in bad]
+                    except Exception as e:
+                        bad = re.findall(r"[A-Z]{2,6}", str(e))
+                        bad = [b for b in bad if b in dust_list]
+                        if not bad:
+                            break
+                        dust_list = [d for d in dust_list if d not in bad]
+
+            # Manter colchão de BNB ($2 mínimo)
+            bal = self.exchange.fetch_balance()
+            bnb = bal["free"].get("BNB", 0)
+            try:
+                bnb_val = bnb * self.exchange.fetch_ticker("BNB/USDT")["last"]
+            except Exception:
+                bnb_val = 0
+            if bnb_val < 2.0:
+                need = max(2.5 - bnb_val, 10.0) / self.exchange.fetch_ticker("BNB/USDT")["last"]
+                qty = self.exchange.amount_to_precision("BNB/USDT", need)
+                self.exchange.create_order("BNB/USDT", "market", "buy", qty)
+                logger.info(f"BNB colchão: comprado {qty} (tinha ${bnb_val:.2f})")
         except Exception as e:
             logger.error(f"Erro na conversão de dust: {e}")
 
