@@ -10,7 +10,7 @@ Fluxo:
     → trailing stop (move SL conforme lucro)
     → se fechar: publica trade.closed, cancela ordens, UPDATE no banco
 """
-import asyncio, logging, os, json, time, numpy as np, ccxt, nats, psycopg2
+import asyncio, logging, os, json, time, numpy as np, ccxt, nats, psycopg2, base64
 from nats.js.api import ConsumerConfig
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -45,6 +45,9 @@ class PositionMonitor:
             "enableRateLimit": True,
         })
         self.positions = {}  # symbol -> position data (cache local)
+
+    async def _kv_key(self, symbol):
+        return base64.b64encode(symbol.encode()).decode()
 
     async def connect_nats(self):
         self.nc = await nats.connect(NATS_URL)
@@ -256,7 +259,7 @@ class PositionMonitor:
                     if new_sl > old_sl:
                         pos["sl_price"] = new_sl
                         pos["trailing_active"] = True
-                        await self.kv.put(symbol.replace("/", "_"), json.dumps(pos).encode())
+                        await self.kv.put((await self._kv_key(symbol)), json.dumps(pos).encode())
                         logger.info(f"  {symbol}: trailing stop atualizado SL={new_sl:.4f} (profit={profit_atr:.1f} ATR)")
             except Exception as e:
                 logger.error(f"Erro trailing {symbol}: {e}")
@@ -324,7 +327,7 @@ class PositionMonitor:
             return  # não fecha, tenta de novo no próximo ciclo
 
         # Remove do KV
-        key = symbol.replace("/", "_")
+        key = (await self._kv_key(symbol))
         try:
             await self.kv.delete(key)
         except Exception:
@@ -359,7 +362,7 @@ class PositionMonitor:
             executions = json.loads(msg.data.decode())
             for ex in executions:
                 symbol = ex["symbol"]
-                key = symbol.replace("/", "_")
+                key = (await self._kv_key(symbol))
 
                 pos = {
                     "symbol": symbol,
