@@ -30,6 +30,8 @@ BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "")
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://crypto_admin:ZNG5z43LaSrk7FEmwu6CPtRUB2IVKdvY@crypto-postgres:5432/crypto_bot")
 DUST_INTERVAL = int(os.getenv("DUST_INTERVAL", "21600"))  # 6h
+BNB_MIN_USD = float(os.getenv("BNB_MIN_USD", "1.0"))       # recompra se < $1
+BNB_TARGET_USD = float(os.getenv("BNB_TARGET_USD", "5.0"))  # compra até $5
 
 
 class PositionMonitor:
@@ -418,11 +420,11 @@ class PositionMonitor:
                 bnb_val = bnb * self.exchange.fetch_ticker("BNB/USDT")["last"]
             except Exception:
                 bnb_val = 0
-            if bnb_val < 2.0:
-                need = max(2.5 - bnb_val, 10.0) / self.exchange.fetch_ticker("BNB/USDT")["last"]
+            if bnb_val < BNB_MIN_USD:
+                need = BNB_TARGET_USD / self.exchange.fetch_ticker("BNB/USDT")["last"]
                 qty = self.exchange.amount_to_precision("BNB/USDT", need)
                 self.exchange.create_order("BNB/USDT", "market", "buy", qty)
-                logger.info(f"BNB colchão: comprado {qty} (tinha ${bnb_val:.2f})")
+                logger.info(f"BNB colchão: comprado {qty} (tinha ${bnb_val:.2f}, alvo ${BNB_TARGET_USD})")
         except Exception as e:
             logger.error(f"Erro na conversão de dust: {e}")
 
