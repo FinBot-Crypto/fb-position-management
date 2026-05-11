@@ -29,6 +29,7 @@ BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "")
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://crypto_admin:ZNG5z43LaSrk7FEmwu6CPtRUB2IVKdvY@crypto-postgres:5432/crypto_bot")
+DUST_INTERVAL = int(os.getenv("DUST_INTERVAL", "21600"))  # 6h
 
 
 class PositionMonitor:
@@ -379,6 +380,40 @@ class PositionMonitor:
         except Exception as e:
             logger.error(f"Erro ao processar trade executado: {e}")
 
+    async def convert_dust(self):
+        """Converte todos os saldos abaixo de $1 para BNB (grátis)."""
+        try:
+            bal = self.exchange.fetch_balance()
+            dust_list = []
+            for a, v in bal["free"].items():
+                if a in ["USDT", "BNB"] or v <= 0:
+                    continue
+                try:
+                    val = v * self.exchange.fetch_ticker(f"{a}/USDT")["last"]
+                except Exception:
+                    val = 0
+                if val < 1:
+                    dust_list.append(a)
+            if not dust_list:
+                return
+
+            import re
+            while dust_list:
+                try:
+                    r = self.exchange.sapi_post_asset_dust({"asset": dust_list})
+                    converted = r.get("transferResult", [])
+                    if converted:
+                        logger.info(f"Dust: {len(converted)} ativos convertidos pra BNB")
+                    break
+                except Exception as e:
+                    bad = re.findall(r"[A-Z]{2,6}", str(e))
+                    bad = [b for b in bad if b in dust_list]
+                    if not bad:
+                        break
+                    dust_list = [d for d in dust_list if d not in bad]
+        except Exception as e:
+            logger.error(f"Erro na conversão de dust: {e}")
+
     async def monitor_loop(self):
         """Loop principal: verifica todas as posições a cada MONITOR_INTERVAL segundos."""
         logger.info(f"fb-position-monitor online (max_hold={MAX_HOLD_HOURS}h, rsi_exit={RSI_EXIT}, trailing={TRAILING_STOP})")
@@ -399,6 +434,14 @@ class PositionMonitor:
                 result = await self.check_position(symbol, pos)
                 if result:
                     await self.close_position(symbol, pos, result)
+
+            # Dust cleanup periódico
+            if not hasattr(self, "_dust_counter"):
+                self._dust_counter = 0
+            self._dust_counter += MONITOR_INTERVAL
+            if self._dust_counter >= DUST_INTERVAL:
+                self._dust_counter = 0
+                await self.convert_dust()
 
             await asyncio.sleep(MONITOR_INTERVAL)
 
