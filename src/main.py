@@ -309,7 +309,13 @@ class PositionMonitor:
                         logger.info(f"  {symbol}: quantidade zero, pulando venda (já foi vendido)")
                     sold_ok = True
                 except Exception as e:
-                    logger.error(f"  {symbol}: erro ao vender: {e} — posição NÃO fechada")
+                    err_msg = str(e)
+                    if "minimum amount precision" in err_msg or "InvalidOrder" in err_msg:
+                        # Dust abaixo do step da Binance → já foi vendido, só limpar
+                        logger.info(f"  {symbol}: dust abaixo do mínimo — marcando como fechado")
+                        sold_ok = True
+                    else:
+                        logger.error(f"  {symbol}: erro ao vender: {err_msg} — posição NÃO fechada")
 
         if not sold_ok:
             return  # não fecha, tenta de novo no próximo ciclo
