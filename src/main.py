@@ -10,7 +10,7 @@ Fluxo:
     → trailing stop (move SL conforme lucro)
     → se fechar: publica trade.closed, cancela ordens, UPDATE no banco
 """
-import asyncio, logging, os, json, time, numpy as np, ccxt, nats, psycopg2, base64
+import asyncio, logging, os, json, time, numpy as np, ccxt, nats, psycopg2, base64, math
 from nats.js.api import ConsumerConfig
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -429,10 +429,13 @@ class PositionMonitor:
             except Exception:
                 bnb_val = 0
             if bnb_val < BNB_MIN_USD:
-                need = BNB_TARGET_USD / self.exchange.fetch_ticker("BNB/USDT")["last"]
-                qty = self.exchange.amount_to_precision("BNB/USDT", need)
-                self.exchange.create_order("BNB/USDT", "market", "buy", qty)
-                logger.info(f"BNB colchão: comprado {qty} (tinha ${bnb_val:.2f}, alvo ${BNB_TARGET_USD})")
+                price = self.exchange.fetch_ticker("BNB/USDT")["last"]
+                need = BNB_TARGET_USD / price
+                step = self.exchange.market("BNB/USDT")["precision"]["amount"]
+                qty = math.ceil(need / step) * step  # arredonda pra cima
+                qty_str = self.exchange.amount_to_precision("BNB/USDT", qty)
+                self.exchange.create_order("BNB/USDT", "market", "buy", qty_str)
+                logger.info(f"BNB colchão: comprado {qty_str} (tinha ${bnb_val:.2f}, alvo ${BNB_TARGET_USD})")
         except Exception as e:
             logger.error(f"Erro na conversão de dust: {e}")
 
