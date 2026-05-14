@@ -333,8 +333,13 @@ class PositionMonitor:
         except Exception:
             pass
 
+        # Remove da memória usando a chave real (base64)
+        if key in self.positions:
+            del self.positions[key]
         if symbol in self.positions:
             del self.positions[symbol]
+        if key in self.positions:
+            del self.positions[key]
 
         # Log no banco
         await self.log_trade_close(symbol, reason_data, pos)
