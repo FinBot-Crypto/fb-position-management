@@ -291,6 +291,7 @@ class PositionMonitor:
 
                 # Market sell: usa saldo total se for a única posição da moeda
                 try:
+                    base = symbol.split("/")[0]
                     # Verifica se há outro trade OPEN do mesmo símbolo
                     conn = psycopg2.connect(DATABASE_URL)
                     cur = conn.cursor()
@@ -299,9 +300,8 @@ class PositionMonitor:
                     cur.close()
                     conn.close()
 
-                    if open_count <= 1:
+                    if open_count <= 1 and base != "BNB":
                         bal = self.exchange.fetch_balance()
-                        base = symbol.split("/")[0]
                         sell_qty = bal["free"].get(base, quantity)
                         logger.info(f"  {symbol}: única posição, vendendo saldo total: {sell_qty}")
                     else:
