@@ -1,14 +1,14 @@
 """
-fb-position-monitor: Monitora posições abertas e decide quando fechar.
+fb-position-monitor: Monitora posições abertas (Spot e Futures) e decide quando fechar.
 
 Fluxo:
-  trade.executed → registra posição + INSERT no banco
+  trade.executed e trade.executed.futures → registra posição + INSERT no banco
   Loop a cada 10s:
     → verifica TP/SL atingido (preço)
     → verifica RSI reversal (RSI > RSI_EXIT)
     → verifica time exit (hold > MAX_HOLD_HOURS)
     → trailing stop (move SL conforme lucro)
-    → se fechar: publica trade.closed, cancela ordens, UPDATE no banco
+    → se fechar: publica trade.closed, envia sinal de venda/fechamento, UPDATE no banco
 """
 import asyncio, logging, os, json, time, numpy as np, ccxt, nats, psycopg2, base64, math
 from nats.js.api import ConsumerConfig
@@ -44,6 +44,14 @@ class PositionMonitor:
             "secret": BINANCE_API_SECRET,
             "enableRateLimit": True,
         })
+        self.futures_exchange = ccxt.binance({
+            "apiKey": BINANCE_API_KEY,
+            "secret": BINANCE_API_SECRET,
+            "enableRateLimit": True,
+            "options": {
+                "defaultType": "future"
+            }
+        })
         self.positions = {}  # symbol -> position data (cache local)
 
     async def _kv_key(self, symbol):
@@ -56,7 +64,7 @@ class PositionMonitor:
         logger.info(f"NATS conectado: {NATS_URL}")
 
     async def init_db(self):
-        """Cria tabela trade_log se não existir."""
+        """Cria tabela trade_log se não existir e aplica migrações."""
         try:
             conn = psycopg2.connect(DATABASE_URL)
             cur = conn.cursor()
@@ -84,9 +92,19 @@ class PositionMonitor:
                 );
             """)
             conn.commit()
+
+            # Migrações seguras
+            try:
+                cur.execute("ALTER TABLE trade_log ADD COLUMN IF NOT EXISTS is_futures BOOLEAN DEFAULT FALSE;")
+                cur.execute("ALTER TABLE trade_log ADD COLUMN IF NOT EXISTS leverage INT DEFAULT 1;")
+                conn.commit()
+            except Exception as e:
+                conn.rollback()
+                logger.warning(f"Erro ao aplicar migrações na tabela trade_log: {e}")
+
             cur.close()
             conn.close()
-            logger.info("Banco de dados conectado, tabela trade_log pronta")
+            logger.info("Banco de dados conectado e migrado, tabela trade_log pronta")
         except Exception as e:
             logger.error(f"Erro ao inicializar banco: {e}")
 
@@ -97,8 +115,8 @@ class PositionMonitor:
             cur = conn.cursor()
             cur.execute("""
                 INSERT INTO trade_log (symbol, tier, strategy, direction, dry_run,
-                    score, rsi, entry_price, quantity, sl_price, tp_price, status)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'OPEN')
+                    score, rsi, entry_price, quantity, sl_price, tp_price, status, is_futures, leverage)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'OPEN', %s, %s)
                 RETURNING id;
             """, (
                 execution.get("symbol"),
@@ -112,12 +130,14 @@ class PositionMonitor:
                 execution.get("quantity"),
                 execution.get("sl_price"),
                 execution.get("tp_price"),
+                execution.get("is_futures", False),
+                execution.get("leverage", 1),
             ))
             trade_id = cur.fetchone()[0]
             conn.commit()
             cur.close()
             conn.close()
-            logger.info(f"  DB: trade #{trade_id} OPEN — {execution['symbol']}")
+            logger.info(f"  DB: trade #{trade_id} OPEN — {execution['symbol']} ({'Futures' if execution.get('is_futures') else 'Spot'})")
             return trade_id
         except Exception as e:
             logger.error(f"Erro ao logar abertura no banco: {e}")
@@ -162,7 +182,7 @@ class PositionMonitor:
                     entry = await self.kv.get(key)
                     pos = json.loads(entry.value.decode())
                     self.positions[key] = pos
-                    logger.info(f"Posição carregada: {key}")
+                    logger.info(f"Posição carregada: {key} ({'Futures' if pos.get('is_futures') else 'Spot'})")
                 except Exception as e:
                     logger.warning(f"Erro ao carregar posição {key}: {e}")
         except Exception as e:
@@ -183,39 +203,62 @@ class PositionMonitor:
         if DRY_RUN:
             return None  # sem sincronia em dry run
         try:
-            base = symbol.split("/")[0]
-            balance = self.exchange.fetch_balance()
-            total_amount = balance["total"].get(base, 0)
-            if total_amount <= 0:
-                # Posição foi fechada externamente (OC/SL/TP executou na Binance)
-                try:
-                    ticker = self.exchange.fetch_ticker(symbol)
-                    exit_price = ticker["last"]
-                except Exception:
-                    exit_price = pos.get("entry_price", 0)
-                pnl_pct = (exit_price / pos["entry_price"] - 1) * 100 if pos.get("entry_price", 0) > 0 else 0
-                return {"reason": "EXCHANGE_CLOSED", "price": exit_price, "pnl_pct": pnl_pct}
+            if pos.get("is_futures"):
+                # Verifica posição de Futures
+                positions = self.futures_exchange.fetch_positions()
+                found = False
+                for p in positions:
+                    if p["symbol"] == symbol and (float(p.get("contracts", 0)) > 0 or float(p.get("info", {}).get("positionAmt", 0)) != 0):
+                        found = True
+                        break
+                if not found:
+                    try:
+                        ticker = self.futures_exchange.fetch_ticker(symbol)
+                        exit_price = ticker["last"]
+                    except Exception:
+                        exit_price = pos.get("entry_price", 0)
+                    pnl_pct = (exit_price / pos["entry_price"] - 1) * 100 if pos.get("entry_price", 0) > 0 else 0
+                    return {"reason": "EXCHANGE_CLOSED", "price": exit_price, "pnl_pct": pnl_pct}
+            else:
+                # Verifica posição Spot
+                base = symbol.split("/")[0]
+                balance = self.exchange.fetch_balance()
+                total_amount = balance["total"].get(base, 0)
+                if total_amount <= 0:
+                    try:
+                        ticker = self.exchange.fetch_ticker(symbol)
+                        exit_price = ticker["last"]
+                    except Exception:
+                        exit_price = pos.get("entry_price", 0)
+                    pnl_pct = (exit_price / pos["entry_price"] - 1) * 100 if pos.get("entry_price", 0) > 0 else 0
+                    return {"reason": "EXCHANGE_CLOSED", "price": exit_price, "pnl_pct": pnl_pct}
         except Exception as e:
             logger.error(f"Erro sync {symbol}: {e}")
-        return None  # posição ainda existe
+        return None
 
     async def check_position(self, symbol, pos):
         """Verifica se uma posição deve ser fechada."""
         try:
-            ticker = self.exchange.fetch_ticker(symbol)
+            current_exchange = self.futures_exchange if pos.get("is_futures") else self.exchange
+            ticker = current_exchange.fetch_ticker(symbol)
             current_price = ticker["last"]
         except Exception as e:
             logger.error(f"Erro ao buscar ticker {symbol}: {e}")
             return None
 
         entry_price = pos["entry_price"]
-        sl_price = pos.get("sl_price", entry_price * 0.98)
+        sl_price = pos.get("sl_price")
+        if sl_price is None:
+            sl_price = entry_price * 0.98
+        elif sl_price <= 0:
+            sl_price = 0.0
+        
         tp_price = pos.get("tp_price", entry_price * 1.06)
         entry_time = pos.get("entry_time", time.time())
         hold_hours = (time.time() - entry_time) / 3600
 
-        # 1. Check SL
-        if current_price <= sl_price:
+        # 1. Check SL (Ignorado para Futures real se sl_price for 0, porém mantido o padrão do monitor)
+        if sl_price > 0 and current_price <= sl_price:
             return {"reason": "STOP_LOSS", "price": current_price, "pnl_pct": (current_price / entry_price - 1) * 100}
 
         # 2. Check TP
@@ -228,7 +271,7 @@ class PositionMonitor:
 
         # 4. Check RSI Reversal (se sobrecomprado, fecha mean reversion)
         try:
-            ohlcv = self.exchange.fetch_ohlcv(symbol, "15m", limit=200)
+            ohlcv = current_exchange.fetch_ohlcv(symbol, "15m", limit=200)
             closes = [c[4] for c in ohlcv]
             if len(closes) >= RSI_PERIOD + 1:
                 rsi = self.compute_rsi(closes)
@@ -237,10 +280,10 @@ class PositionMonitor:
         except Exception as e:
             logger.error(f"Erro RSI {symbol}: {e}")
 
-        # 5. Trailing Stop
-        if TRAILING_STOP and TRAILING_ACTIVATION > 0:
+        # 5. Trailing Stop (Aplica-se apenas ao Spot no fluxo padrão, ou a Futures se houver SL)
+        if sl_price > 0 and TRAILING_STOP and TRAILING_ACTIVATION > 0:
             try:
-                ohlcv = self.exchange.fetch_ohlcv(symbol, "15m", limit=50)
+                ohlcv = current_exchange.fetch_ohlcv(symbol, "15m", limit=50)
                 highs = [c[2] for c in ohlcv]
                 lows = [c[3] for c in ohlcv]
                 tr_closes = [c[4] for c in ohlcv]
@@ -273,26 +316,34 @@ class PositionMonitor:
         pnl_pct = reason_data["pnl_pct"]
         entry_price = pos["entry_price"]
         quantity = pos["quantity"]
+        is_futures = pos.get("is_futures", False)
 
-        logger.info(f"FECHANDO {symbol}: {reason} @ {price:.6f} | PnL: {pnl_pct:.2f}%")
+        logger.info(f"FECHANDO {symbol} ({'Futures' if is_futures else 'Spot'}): {reason} @ {price:.6f} | PnL: {pnl_pct:.2f}%")
 
         sold_ok = DRY_RUN  # dry run sempre ok
 
         if not DRY_RUN:
-            # Se foi fechado externamente (OCO), só confirma
             if reason == "EXCHANGE_CLOSED":
-                sold_ok = True  # já foi fechado pela Binance
+                sold_ok = True
+            elif is_futures:
+                # Envia sinal de fechamento para o microserviço fb-execution-futures
+                try:
+                    payload = json.dumps({"symbol": symbol}).encode()
+                    await self.js.publish("trade.close.futures", payload)
+                    logger.info(f"  {symbol}: Publicado evento em trade.close.futures")
+                    sold_ok = True
+                except Exception as e:
+                    logger.error(f"  {symbol}: Erro ao publicar trade.close.futures: {e}")
             else:
-                # Cancela OCO
+                # Cancelamento Spot OCO
                 try:
                     self.exchange.cancel_all_orders(symbol)
                 except Exception as e:
-                    logger.error(f"  {symbol}: erro ao cancelar ordens: {e}")
+                    logger.error(f"  {symbol}: erro ao cancelar ordens Spot: {e}")
 
-                # Market sell: usa saldo total se for a única posição da moeda
+                # Market sell Spot
                 try:
                     base = symbol.split("/")[0]
-                    # Verifica se há outro trade OPEN do mesmo símbolo
                     conn = psycopg2.connect(DATABASE_URL)
                     cur = conn.cursor()
                     cur.execute("SELECT COUNT(*) FROM trade_log WHERE symbol = %s AND status = 'OPEN'", (symbol,))
@@ -309,22 +360,21 @@ class PositionMonitor:
 
                     qty_str = self.exchange.amount_to_precision(symbol, sell_qty)
                     if float(qty_str) > 0:
-                        sell_order = self.exchange.create_order(symbol, "market", "sell", qty_str)
-                        logger.info(f"  {symbol}: SELL executado {qty_str} @ ~{price}")
+                        self.exchange.create_order(symbol, "market", "sell", qty_str)
+                        logger.info(f"  {symbol}: SELL Spot executado {qty_str} @ ~{price}")
                     else:
                         logger.info(f"  {symbol}: quantidade zero, pulando venda (já foi vendido)")
                     sold_ok = True
                 except Exception as e:
                     err_msg = str(e)
                     if "minimum amount precision" in err_msg or "InvalidOrder" in err_msg:
-                        # Dust abaixo do step da Binance → já foi vendido, só limpar
                         logger.info(f"  {symbol}: dust abaixo do mínimo — marcando como fechado")
                         sold_ok = True
                     else:
-                        logger.error(f"  {symbol}: erro ao vender: {err_msg} — posição NÃO fechada")
+                        logger.error(f"  {symbol}: erro ao vender Spot: {err_msg} — posição NÃO fechada")
 
         if not sold_ok:
-            return  # não fecha, tenta de novo no próximo ciclo
+            return
 
         # Remove do KV
         key = (await self._kv_key(symbol))
@@ -333,13 +383,11 @@ class PositionMonitor:
         except Exception:
             pass
 
-        # Remove da memória usando a chave real (base64)
+        # Remove da memória
         if key in self.positions:
             del self.positions[key]
         if symbol in self.positions:
             del self.positions[symbol]
-        if key in self.positions:
-            del self.positions[key]
 
         # Log no banco
         await self.log_trade_close(symbol, reason_data, pos)
@@ -355,6 +403,8 @@ class PositionMonitor:
             "exit_reason": reason,
             "pnl_pct": round(pnl_pct, 2),
             "hold_hours": round((time.time() - pos.get("entry_time", time.time())) / 3600, 2),
+            "is_futures": is_futures,
+            "leverage": pos.get("leverage", 1),
             "timestamp": time.time(),
         }
         payload = json.dumps(close_event).encode()
@@ -362,12 +412,13 @@ class PositionMonitor:
         logger.info(f"  {symbol}: trade.closed publicado")
 
     async def process_executed_trade(self, msg):
-        """Registra nova posição quando trade é executado."""
+        """Registra nova posição quando trade (Spot ou Futures) é executado."""
         try:
             executions = json.loads(msg.data.decode())
             for ex in executions:
                 symbol = ex["symbol"]
                 key = (await self._kv_key(symbol))
+                is_futures = ex.get("is_futures", False)
 
                 pos = {
                     "symbol": symbol,
@@ -379,19 +430,21 @@ class PositionMonitor:
                     "tp_price": ex.get("tp_price", 0),
                     "entry_time": time.time(),
                     "trailing_active": False,
+                    "is_futures": is_futures,
+                    "leverage": ex.get("leverage", 1)
                 }
 
                 self.positions[key] = pos
                 await self.kv.put(key, json.dumps(pos).encode())
                 await self.log_trade_open(ex)
-                logger.info(f"POSIÇÃO ABERTA: {symbol} qty={ex['quantity']} entry={ex['entry_price']}")
+                logger.info(f"POSIÇÃO ABERTA: {symbol} qty={ex['quantity']} entry={ex['entry_price']} ({'Futures' if is_futures else 'Spot'})")
 
             await msg.ack()
         except Exception as e:
             logger.error(f"Erro ao processar trade executado: {e}")
 
     async def convert_dust(self):
-        """Converte todos os saldos abaixo de $1 para BNB (grátis). Mantém colchão de BNB."""
+        """Converte todos os saldos abaixo de $1 para BNB. Mantém colchão de BNB. Apenas para conta Spot."""
         try:
             bal = self.exchange.fetch_balance()
             dust_list = []
@@ -421,7 +474,7 @@ class PositionMonitor:
                             break
                         dust_list = [d for d in dust_list if d not in bad]
 
-            # Manter colchão de BNB ($2 mínimo)
+            # Manter colchão de BNB
             bal = self.exchange.fetch_balance()
             bnb = bal["free"].get("BNB", 0)
             try:
@@ -432,7 +485,7 @@ class PositionMonitor:
                 price = self.exchange.fetch_ticker("BNB/USDT")["last"]
                 need = BNB_TARGET_USD / price
                 step = self.exchange.market("BNB/USDT")["precision"]["amount"]
-                qty = math.ceil(need / step) * step  # arredonda pra cima
+                qty = math.ceil(need / step) * step
                 qty_str = self.exchange.amount_to_precision("BNB/USDT", qty)
                 self.exchange.create_order("BNB/USDT", "market", "buy", qty_str)
                 logger.info(f"BNB colchão: comprado {qty_str} (tinha ${bnb_val:.2f}, alvo ${BNB_TARGET_USD})")
@@ -450,12 +503,12 @@ class PositionMonitor:
             positions_snapshot = list(self.positions.items())
             for key, pos in positions_snapshot:
                 symbol = pos["symbol"]
-                # 0. Sync: verifica se posição ainda existe na Binance (fechada por OCO?)
+                # 0. Sync: verifica se posição ainda existe na Binance
                 exchange_result = await self.sync_position_with_exchange(symbol, pos)
                 if exchange_result:
                     await self.close_position(symbol, pos, exchange_result)
                     continue
-                # 1-5. Checks normais (TP/SL/RSI/time/trailing)
+                # 1-5. Checks normais
                 result = await self.check_position(symbol, pos)
                 if result:
                     await self.close_position(symbol, pos, result)
@@ -475,8 +528,13 @@ class PositionMonitor:
         await self.init_db()
         await self.load_positions_from_kv()
 
-        # Subscreve a trade.executed para registrar novas posições
+        # Subscreve a trade.executed para registrar novas posições Spot
         await self.js.subscribe("trade.executed", durable="POSITION_MONITOR_WORKER",
+                                 cb=self.process_executed_trade, manual_ack=True,
+                                 config=ConsumerConfig(ack_wait=30))
+
+        # Subscreve a trade.executed.futures para registrar novas posições Futures
+        await self.js.subscribe("trade.executed.futures", durable="POSITION_MONITOR_FUTURES_WORKER",
                                  cb=self.process_executed_trade, manual_ack=True,
                                  config=ConsumerConfig(ack_wait=30))
 
