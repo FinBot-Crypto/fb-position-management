@@ -431,7 +431,9 @@ class PositionMonitor:
                     "entry_time": time.time(),
                     "trailing_active": False,
                     "is_futures": is_futures,
-                    "leverage": ex.get("leverage", 1)
+                    "leverage": ex.get("leverage", 1),
+                    "score": ex.get("score"),
+                    "rsi": ex.get("rsi")
                 }
 
                 self.positions[key] = pos
