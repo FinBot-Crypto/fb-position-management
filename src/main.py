@@ -270,15 +270,16 @@ class PositionMonitor:
             return {"reason": "TIME_EXIT", "price": current_price, "pnl_pct": (current_price / entry_price - 1) * 100}
 
         # 4. Check RSI Reversal (se sobrecomprado, fecha mean reversion)
-        try:
-            ohlcv = current_exchange.fetch_ohlcv(symbol, "15m", limit=200)
-            closes = [c[4] for c in ohlcv]
-            if len(closes) >= RSI_PERIOD + 1:
-                rsi = self.compute_rsi(closes)
-                if rsi >= RSI_EXIT:
-                    return {"reason": "RSI_REVERSAL", "price": current_price, "rsi": rsi, "pnl_pct": (current_price / entry_price - 1) * 100}
-        except Exception as e:
-            logger.error(f"Erro RSI {symbol}: {e}")
+        if RSI_EXIT > 0 and RSI_EXIT < 100:
+            try:
+                ohlcv = current_exchange.fetch_ohlcv(symbol, "15m", limit=200)
+                closes = [c[4] for c in ohlcv]
+                if len(closes) >= RSI_PERIOD + 1:
+                    rsi = self.compute_rsi(closes)
+                    if rsi >= RSI_EXIT:
+                        return {"reason": "RSI_REVERSAL", "price": current_price, "rsi": rsi, "pnl_pct": (current_price / entry_price - 1) * 100}
+            except Exception as e:
+                logger.error(f"Erro RSI {symbol}: {e}")
 
         # 5. Trailing Stop (Aplica-se apenas ao Spot no fluxo padrão, ou a Futures se houver SL)
         if sl_price > 0 and TRAILING_STOP and TRAILING_ACTIVATION > 0:
