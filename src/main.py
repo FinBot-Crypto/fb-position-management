@@ -52,7 +52,18 @@ class PositionMonitor:
                 "defaultType": "future"
             }
         })
+        try:
+            self.exchange.load_markets()
+            self.futures_exchange.load_markets()
+            logger.info("Mercados carregados na inicialização (Spot & Futures)")
+        except Exception as e:
+            logger.warning(f"Falha ao carregar mercados na inicialização: {e}")
         self.positions = {}  # symbol -> position data (cache local)
+
+    def _exchange_symbol(self, symbol, is_futures):
+        if is_futures and ":" not in symbol:
+            return f"{symbol}:USDT"
+        return symbol
 
     async def _kv_key(self, symbol):
         return base64.b64encode(symbol.encode()).decode()
@@ -207,13 +218,14 @@ class PositionMonitor:
                 # Verifica posição de Futures
                 positions = self.futures_exchange.fetch_positions()
                 found = False
+                ccxt_symbol = self._exchange_symbol(symbol, True)
                 for p in positions:
-                    if p["symbol"] == symbol and (float(p.get("contracts", 0)) > 0 or float(p.get("info", {}).get("positionAmt", 0)) != 0):
+                    if p["symbol"] == ccxt_symbol and (float(p.get("contracts", 0)) > 0 or float(p.get("info", {}).get("positionAmt", 0)) != 0):
                         found = True
                         break
                 if not found:
                     try:
-                        ticker = self.futures_exchange.fetch_ticker(symbol)
+                        ticker = self.futures_exchange.fetch_ticker(ccxt_symbol)
                         exit_price = ticker["last"]
                     except Exception:
                         exit_price = pos.get("entry_price", 0)
@@ -238,12 +250,14 @@ class PositionMonitor:
 
     async def check_position(self, symbol, pos):
         """Verifica se uma posição deve ser fechada."""
+        is_futures = pos.get("is_futures", False)
+        ccxt_symbol = self._exchange_symbol(symbol, is_futures)
         try:
-            current_exchange = self.futures_exchange if pos.get("is_futures") else self.exchange
-            ticker = current_exchange.fetch_ticker(symbol)
+            current_exchange = self.futures_exchange if is_futures else self.exchange
+            ticker = current_exchange.fetch_ticker(ccxt_symbol)
             current_price = ticker["last"]
         except Exception as e:
-            logger.error(f"Erro ao buscar ticker {symbol}: {e}")
+            logger.error(f"Erro ao buscar ticker {symbol} (ccxt: {ccxt_symbol}): {e}")
             return None
 
         entry_price = pos["entry_price"]
@@ -272,7 +286,7 @@ class PositionMonitor:
         # 4. Check RSI Reversal (se sobrecomprado, fecha mean reversion)
         if RSI_EXIT > 0 and RSI_EXIT < 100:
             try:
-                ohlcv = current_exchange.fetch_ohlcv(symbol, "15m", limit=200)
+                ohlcv = current_exchange.fetch_ohlcv(ccxt_symbol, "15m", limit=200)
                 closes = [c[4] for c in ohlcv]
                 if len(closes) >= RSI_PERIOD + 1:
                     rsi = self.compute_rsi(closes)
@@ -284,7 +298,7 @@ class PositionMonitor:
         # 5. Trailing Stop (Aplica-se apenas ao Spot no fluxo padrão, ou a Futures se houver SL)
         if sl_price > 0 and TRAILING_STOP and TRAILING_ACTIVATION > 0:
             try:
-                ohlcv = current_exchange.fetch_ohlcv(symbol, "15m", limit=50)
+                ohlcv = current_exchange.fetch_ohlcv(ccxt_symbol, "15m", limit=50)
                 highs = [c[2] for c in ohlcv]
                 lows = [c[3] for c in ohlcv]
                 tr_closes = [c[4] for c in ohlcv]
@@ -357,7 +371,16 @@ class PositionMonitor:
                         sell_qty = bal["free"].get(base, quantity)
                         logger.info(f"  {symbol}: única posição, vendendo saldo total: {sell_qty}")
                     else:
-                        sell_qty = quantity
+                        if base == "BNB":
+                            bal = self.exchange.fetch_balance()
+                            free_bnb = bal["free"].get("BNB", 0.0)
+                            sell_qty = min(quantity, free_bnb)
+                            if sell_qty <= 0:
+                                logger.info(f"  {symbol}: saldo BNB zerado, pulando venda")
+                            else:
+                                logger.info(f"  {symbol}: BNB cushion, limitando venda para {sell_qty} de {quantity} (disponível: {free_bnb})")
+                        else:
+                            sell_qty = quantity
 
                     qty_str = self.exchange.amount_to_precision(symbol, sell_qty)
                     if float(qty_str) > 0:
