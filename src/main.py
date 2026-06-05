@@ -108,6 +108,7 @@ class PositionMonitor:
             try:
                 cur.execute("ALTER TABLE trade_log ADD COLUMN IF NOT EXISTS is_futures BOOLEAN DEFAULT FALSE;")
                 cur.execute("ALTER TABLE trade_log ADD COLUMN IF NOT EXISTS leverage INT DEFAULT 1;")
+                cur.execute("ALTER TABLE trade_log ADD COLUMN IF NOT EXISTS market_regime VARCHAR(10);")
                 conn.commit()
             except Exception as e:
                 conn.rollback()
@@ -126,8 +127,8 @@ class PositionMonitor:
             cur = conn.cursor()
             cur.execute("""
                 INSERT INTO trade_log (symbol, tier, strategy, direction, dry_run,
-                    score, rsi, entry_price, quantity, sl_price, tp_price, status, is_futures, leverage)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'OPEN', %s, %s)
+                    score, rsi, entry_price, quantity, sl_price, tp_price, status, is_futures, leverage, market_regime)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'OPEN', %s, %s, %s)
                 RETURNING id;
             """, (
                 execution.get("symbol"),
@@ -143,6 +144,7 @@ class PositionMonitor:
                 execution.get("tp_price"),
                 execution.get("is_futures", False),
                 execution.get("leverage", 1),
+                execution.get("market_regime", "neutral"),
             ))
             trade_id = cur.fetchone()[0]
             conn.commit()
@@ -457,7 +459,8 @@ class PositionMonitor:
                     "is_futures": is_futures,
                     "leverage": ex.get("leverage", 1),
                     "score": ex.get("score"),
-                    "rsi": ex.get("rsi")
+                    "rsi": ex.get("rsi"),
+                    "market_regime": ex.get("market_regime", "neutral")
                 }
 
                 self.positions[key] = pos
