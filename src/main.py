@@ -231,7 +231,11 @@ class PositionMonitor:
                         exit_price = ticker["last"]
                     except Exception:
                         exit_price = pos.get("entry_price", 0)
-                    pnl_pct = (exit_price / pos["entry_price"] - 1) * 100 if pos.get("entry_price", 0) > 0 else 0
+                    direction = pos.get("direction", "LONG")
+                    if direction == "SHORT":
+                        pnl_pct = (1 - exit_price / pos["entry_price"]) * 100 if pos.get("entry_price", 0) > 0 else 0
+                    else:
+                        pnl_pct = (exit_price / pos["entry_price"] - 1) * 100 if pos.get("entry_price", 0) > 0 else 0
                     return {"reason": "EXCHANGE_CLOSED", "price": exit_price, "pnl_pct": pnl_pct}
             else:
                 # Verifica posição Spot
@@ -244,7 +248,11 @@ class PositionMonitor:
                         exit_price = ticker["last"]
                     except Exception:
                         exit_price = pos.get("entry_price", 0)
-                    pnl_pct = (exit_price / pos["entry_price"] - 1) * 100 if pos.get("entry_price", 0) > 0 else 0
+                    direction = pos.get("direction", "LONG")
+                    if direction == "SHORT":
+                        pnl_pct = (1 - exit_price / pos["entry_price"]) * 100 if pos.get("entry_price", 0) > 0 else 0
+                    else:
+                        pnl_pct = (exit_price / pos["entry_price"] - 1) * 100 if pos.get("entry_price", 0) > 0 else 0
                     return {"reason": "EXCHANGE_CLOSED", "price": exit_price, "pnl_pct": pnl_pct}
         except Exception as e:
             logger.error(f"Erro sync {symbol}: {e}")
@@ -264,40 +272,60 @@ class PositionMonitor:
 
         entry_price = pos["entry_price"]
         sl_price = pos.get("sl_price")
+        tp_price = pos.get("tp_price")
+        direction = pos.get("direction", "LONG")
+        is_short = direction == "SHORT"
+
+        # Cálculo do PnL com base na direção do trade
+        if is_short:
+            pnl_pct = (1 - current_price / entry_price) * 100
+        else:
+            pnl_pct = (current_price / entry_price - 1) * 100
+
+        # Configura limites padrão se forem nulos
         if sl_price is None:
-            sl_price = entry_price * 0.98
+            sl_price = entry_price * 1.02 if is_short else entry_price * 0.98
         elif sl_price <= 0:
             sl_price = 0.0
-        
-        tp_price = pos.get("tp_price", entry_price * 1.06)
+
+        if tp_price is None or tp_price <= 0:
+            tp_price = entry_price * 0.94 if is_short else entry_price * 1.06
+
         entry_time = pos.get("entry_time", time.time())
         hold_hours = (time.time() - entry_time) / 3600
 
-        # 1. Check SL (Ignorado para Futures real se sl_price for 0, porém mantido o padrão do monitor)
-        if sl_price > 0 and current_price <= sl_price:
-            return {"reason": "STOP_LOSS", "price": current_price, "pnl_pct": (current_price / entry_price - 1) * 100}
+        # 1. Verifica Stop Loss conforme a direção
+        if sl_price > 0:
+            if is_short and current_price >= sl_price:
+                return {"reason": "STOP_LOSS", "price": current_price, "pnl_pct": pnl_pct}
+            elif not is_short and current_price <= sl_price:
+                return {"reason": "STOP_LOSS", "price": current_price, "pnl_pct": pnl_pct}
 
-        # 2. Check TP
-        if current_price >= tp_price:
-            return {"reason": "TAKE_PROFIT", "price": current_price, "pnl_pct": (current_price / entry_price - 1) * 100}
+        # 2. Verifica Take Profit conforme a direção
+        if is_short and current_price <= tp_price:
+            return {"reason": "TAKE_PROFIT", "price": current_price, "pnl_pct": pnl_pct}
+        elif not is_short and current_price >= tp_price:
+            return {"reason": "TAKE_PROFIT", "price": current_price, "pnl_pct": pnl_pct}
 
-        # 3. Check Time Exit
+        # 3. Verifica Time Exit
         if hold_hours >= MAX_HOLD_HOURS:
-            return {"reason": "TIME_EXIT", "price": current_price, "pnl_pct": (current_price / entry_price - 1) * 100}
+            return {"reason": "TIME_EXIT", "price": current_price, "pnl_pct": pnl_pct}
 
-        # 4. Check RSI Reversal (se sobrecomprado, fecha mean reversion)
+        # 4. Verifica RSI Reversal (Ignorado se RSI_EXIT for inativo)
         if RSI_EXIT > 0 and RSI_EXIT < 100:
             try:
                 ohlcv = current_exchange.fetch_ohlcv(ccxt_symbol, "15m", limit=200)
                 closes = [c[4] for c in ohlcv]
                 if len(closes) >= RSI_PERIOD + 1:
                     rsi = self.compute_rsi(closes)
-                    if rsi >= RSI_EXIT:
-                        return {"reason": "RSI_REVERSAL", "price": current_price, "rsi": rsi, "pnl_pct": (current_price / entry_price - 1) * 100}
+                    if is_short and rsi <= (100 - RSI_EXIT):
+                        return {"reason": "RSI_REVERSAL", "price": current_price, "rsi": rsi, "pnl_pct": pnl_pct}
+                    elif not is_short and rsi >= RSI_EXIT:
+                        return {"reason": "RSI_REVERSAL", "price": current_price, "rsi": rsi, "pnl_pct": pnl_pct}
             except Exception as e:
                 logger.error(f"Erro RSI {symbol}: {e}")
 
-        # 5. Trailing Stop (Aplica-se apenas ao Spot no fluxo padrão, ou a Futures se houver SL)
+        # 5. Trailing Stop conforme a direção
         if sl_price > 0 and TRAILING_STOP and TRAILING_ACTIVATION > 0:
             try:
                 ohlcv = current_exchange.fetch_ohlcv(ccxt_symbol, "15m", limit=50)
@@ -311,16 +339,26 @@ class PositionMonitor:
                 ])
                 atr = float(np.mean(tr[-14:])) if len(tr) >= 14 else 0.01
 
-                profit_atr = (current_price - entry_price) / atr if atr > 0 else 0
-
-                if profit_atr >= TRAILING_ACTIVATION:
-                    new_sl = current_price - TRAILING_ATR * atr
-                    old_sl = pos.get("sl_price", 0)
-                    if new_sl > old_sl:
-                        pos["sl_price"] = new_sl
-                        pos["trailing_active"] = True
-                        await self.kv.put((await self._kv_key(symbol)), json.dumps(pos).encode())
-                        logger.info(f"  {symbol}: trailing stop atualizado SL={new_sl:.4f} (profit={profit_atr:.1f} ATR)")
+                if is_short:
+                    profit_atr = (entry_price - current_price) / atr if atr > 0 else 0
+                    if profit_atr >= TRAILING_ACTIVATION:
+                        new_sl = current_price + TRAILING_ATR * atr
+                        old_sl = pos.get("sl_price", 99999999.0)
+                        if new_sl < old_sl:
+                            pos["sl_price"] = new_sl
+                            pos["trailing_active"] = True
+                            await self.kv.put((await self._kv_key(symbol)), json.dumps(pos).encode())
+                            logger.info(f"  {symbol} (SHORT): trailing stop atualizado SL={new_sl:.4f} (profit={profit_atr:.1f} ATR)")
+                else:
+                    profit_atr = (current_price - entry_price) / atr if atr > 0 else 0
+                    if profit_atr >= TRAILING_ACTIVATION:
+                        new_sl = current_price - TRAILING_ATR * atr
+                        old_sl = pos.get("sl_price", 0)
+                        if new_sl > old_sl:
+                            pos["sl_price"] = new_sl
+                            pos["trailing_active"] = True
+                            await self.kv.put((await self._kv_key(symbol)), json.dumps(pos).encode())
+                            logger.info(f"  {symbol} (LONG): trailing stop atualizado SL={new_sl:.4f} (profit={profit_atr:.1f} ATR)")
             except Exception as e:
                 logger.error(f"Erro trailing {symbol}: {e}")
 
@@ -460,7 +498,8 @@ class PositionMonitor:
                     "leverage": ex.get("leverage", 1),
                     "score": ex.get("score"),
                     "rsi": ex.get("rsi"),
-                    "market_regime": ex.get("market_regime", "neutral")
+                    "market_regime": ex.get("market_regime", "neutral"),
+                    "direction": ex.get("direction", "LONG")
                 }
 
                 self.positions[key] = pos
