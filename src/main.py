@@ -441,8 +441,8 @@ class PositionMonitor:
             return
 
         # Remove do KV (apenas para Spot; para Futures, o fb-execution-futures remove após executar na exchange)
+        key = await self._kv_key(symbol)
         if not is_futures:
-            key = (await self._kv_key(symbol))
             try:
                 await self.kv.delete(key)
             except Exception:
