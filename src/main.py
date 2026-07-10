@@ -43,11 +43,13 @@ class PositionMonitor:
             "apiKey": BINANCE_API_KEY,
             "secret": BINANCE_API_SECRET,
             "enableRateLimit": True,
+            "timeout": 15000,
         })
         self.futures_exchange = ccxt.binance({
             "apiKey": BINANCE_API_KEY,
             "secret": BINANCE_API_SECRET,
             "enableRateLimit": True,
+            "timeout": 15000,
             "options": {
                 "defaultType": "future"
             }
